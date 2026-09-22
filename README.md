@@ -4,7 +4,7 @@ Capture RGB-D video from an Intel RealSense camera and turn it into a dense,
 colored 3D point cloud (optionally a mesh), using COLMAP for camera pose
 estimation.
 
-![my house](./media/Screenshot from 2026-09-21 21-56-37.png)
+![my house](./media/my_house.png)
 
 ## How it works
 
