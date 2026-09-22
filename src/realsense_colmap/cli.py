@@ -20,12 +20,13 @@ def _cmd_capture(args: argparse.Namespace) -> None:
         color_gain=args.color_gain,
         auto_exposure_priority=args.auto_exposure_priority,
         laser_power=args.laser_power,
+        emitter_enabled=not args.no_emitter,
     )
 
 
 def _cmd_reconstruct(args: argparse.Namespace) -> None:
     from .dense import fuse_dense_point_cloud, mesh_from_point_cloud
-    from .intrinsics import Intrinsics
+    from .intrinsics import ColorCalibration, Intrinsics
     from .scale import estimate_scale
     from .sparse import run_sparse_reconstruction
 
@@ -35,12 +36,14 @@ def _cmd_reconstruct(args: argparse.Namespace) -> None:
     output_dir = Path(args.output) if args.output else input_dir / "reconstruction"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    color_dir = input_dir / "color"
+    ir_dir = input_dir / "ir"
     depth_dir = input_dir / "depth"
+    rgb_dir = input_dir / "rgb"
     intrinsics = Intrinsics.load(input_dir / "intrinsics.json")
+    color_calibration = ColorCalibration.load(input_dir / "color_calibration.json")
 
     reconstruction = run_sparse_reconstruction(
-        image_dir=color_dir,
+        image_dir=ir_dir,
         database_path=output_dir / "database.db",
         sparse_dir=output_dir / "sparse",
         intrinsics=intrinsics,
@@ -57,9 +60,10 @@ def _cmd_reconstruct(args: argparse.Namespace) -> None:
 
     pcd = fuse_dense_point_cloud(
         reconstruction,
-        color_dir=color_dir,
+        rgb_dir=rgb_dir,
         depth_dir=depth_dir,
         intrinsics=intrinsics,
+        color_calibration=color_calibration,
         scale=scale,
         min_depth=args.min_depth,
         max_depth=args.max_depth,
@@ -97,9 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     cap = subparsers.add_parser("capture", help="record color+depth frames")
     cap.add_argument("-o", "--output", required=True, help="output directory")
-    cap.add_argument("--width", type=int, default=640)
-    cap.add_argument("--height", type=int, default=480)
-    cap.add_argument("--fps", type=int, default=30)
+    cap.add_argument("--width", type=int, default=1280)
+    cap.add_argument("--height", type=int, default=720)
+    cap.add_argument("--fps", type=int, default=15)
     cap.add_argument(
         "--num-frames", type=int, default=None, help="stop after this many saved frames"
     )
@@ -150,6 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
         "Raise this in low light / low-texture scenes to improve depth "
         "quality -- the depth sensor relies on its own projected IR pattern "
         "more when there's less ambient light for it to work with.",
+    )
+    cap.add_argument(
+        "--no-emitter",
+        action="store_true",
+        help="disable the IR dot projector entirely. Depth quality will "
+        "degrade in low-texture/dark areas (that's what the emitter is for), "
+        "but it also removes the projector's repetitive dot pattern from the "
+        "infrared images COLMAP matches on, which can otherwise get "
+        "misclassified as a near-static 'watermark' and produce spurious "
+        "matches. Mainly useful for testing which effect dominates.",
     )
     cap.set_defaults(func=_cmd_capture)
 

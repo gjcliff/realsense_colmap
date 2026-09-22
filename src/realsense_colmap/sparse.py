@@ -1,5 +1,8 @@
 """Structure-from-motion via pycolmap: recover a camera trajectory (poses,
-up to an unknown scale) from the captured color images."""
+up to an unknown scale) from the captured infrared images. Infrared, not
+color, because it's global-shutter (like the rest of the depth/stereo
+module) -- the RGB sensor is rolling-shutter, which breaks the
+single-rigid-pose-per-frame assumption SfM relies on."""
 
 from __future__ import annotations
 

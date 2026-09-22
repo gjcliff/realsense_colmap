@@ -5,7 +5,11 @@ We deliberately don't use COLMAP's own dense multi-view stereo here: it would
 re-derive depth photometrically from the RGB images alone, which is both more
 expensive and less accurate than the depth we already measured with the
 sensor. COLMAP is used only for what it's good at -- recovering the camera
-trajectory.
+trajectory (from infrared images; see sparse.py/capture.py for why).
+
+Color never enters COLMAP or the pose/geometry computation here either: it's
+reprojected onto the depth-derived geometry per-point, using the calibrated
+depth-to-color extrinsic, purely to paint points.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import open3d as o3d
 import pycolmap
 from tqdm import tqdm
 
-from .intrinsics import Intrinsics
+from .intrinsics import ColorCalibration, Intrinsics
 
 # Neighboring depth pixels whose z jumps by more than this are a depth edge /
 # "flying pixel" artifact, not real surface -- both the point and any normal
@@ -28,9 +32,10 @@ _MAX_DEPTH_DISCONTINUITY = 0.03  # meters
 
 def fuse_dense_point_cloud(
     reconstruction: pycolmap.Reconstruction,
-    color_dir: Path,
+    rgb_dir: Path,
     depth_dir: Path,
     intrinsics: Intrinsics,
+    color_calibration: ColorCalibration,
     scale: float,
     min_depth: float = 0.1,
     max_depth: float = 8.0,
@@ -38,7 +43,8 @@ def fuse_dense_point_cloud(
     stride: int = 2,
 ) -> o3d.geometry.PointCloud:
     """Back-project every valid depth pixel of every registered frame into a
-    shared world frame and merge into one point cloud.
+    shared world frame and merge into one point cloud, painted by reprojecting
+    each point into the (native, unwarped) RGB image.
 
     `stride` subsamples pixels (e.g. 2 keeps every other pixel in x and y)
     to keep the raw cloud a manageable size before voxel downsampling.
@@ -52,6 +58,14 @@ def fuse_dense_point_cloud(
     x_over_z = (us - cx) / fx
     y_over_z = (vs - cy) / fy
 
+    # depth-frame -> color-frame extrinsic, for reprojecting points into the
+    # native (unwarped) RGB image to sample color. p_color = R @ p_depth + t.
+    color_R = color_calibration.rotation_matrix()
+    color_t = np.array(color_calibration.translation, dtype=np.float64)
+    cfx, cfy = color_calibration.fx, color_calibration.fy
+    ccx, ccy = color_calibration.cx, color_calibration.cy
+    color_w, color_h = color_calibration.width, color_calibration.height
+
     all_points = []
     all_colors = []
     all_normals = []
@@ -59,19 +73,39 @@ def fuse_dense_point_cloud(
     registered = [img for img in reconstruction.images.values() if img.has_pose]
     for image in tqdm(registered, desc="fusing depth"):
         depth_path = depth_dir / image.name
-        color_path = color_dir / image.name
+        color_path = rgb_dir / image.name
         depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
         color_bgr = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
         if depth_raw is None or color_bgr is None:
             continue
 
         depth_m = depth_raw[::stride, ::stride].astype(np.float32) * intrinsics.depth_scale
-        color = color_bgr[::stride, ::stride].astype(np.float32) / 255.0
 
         z = depth_m
         x = x_over_z * z
         y = y_over_z * z
-        grid = np.stack([x, y, z], axis=-1)  # (H', W', 3), camera frame
+        grid = np.stack([x, y, z], axis=-1)  # (H', W', 3), depth/IR camera frame
+
+        # Reproject into the color camera to look up each pixel's paint.
+        p_color = grid @ color_R.T + color_t
+        z_color = p_color[..., 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u_color = cfx * p_color[..., 0] / z_color + ccx
+            v_color = cfy * p_color[..., 1] / z_color + ccy
+        u_idx = np.round(u_color).astype(np.int32)
+        v_idx = np.round(v_color).astype(np.int32)
+        color_valid = (
+            (z_color > 1e-6)
+            & (u_idx >= 0)
+            & (u_idx < color_w)
+            & (v_idx >= 0)
+            & (v_idx < color_h)
+        )
+        # Clip so out-of-bounds indices don't fault the gather below; those
+        # pixels are excluded from the final mask regardless.
+        u_safe = np.clip(u_idx, 0, color_w - 1)
+        v_safe = np.clip(v_idx, 0, color_h - 1)
+        color = color_bgr[v_safe, u_safe].astype(np.float32) / 255.0
 
         # A depth image is already an organized point cloud, so surface normals
         # come straight from finite differences between grid neighbors -- no
@@ -98,6 +132,7 @@ def fuse_dense_point_cloud(
             & (lengths[..., 0] > 1e-9)
             & (np.abs(dx[..., 2]) < _MAX_DEPTH_DISCONTINUITY)
             & (np.abs(dy[..., 2]) < _MAX_DEPTH_DISCONTINUITY)
+            & color_valid
         )
         if not np.any(valid):
             continue
@@ -122,6 +157,25 @@ def fuse_dense_point_cloud(
     points = np.concatenate(all_points, axis=0)
     colors = np.concatenate(all_colors, axis=0)
     normals = np.concatenate(all_normals, axis=0)
+
+    # A handful of badly-triangulated SfM points (e.g. from a near-degenerate
+    # solve) can put a few camera centers at wild coordinates once scaled,
+    # producing points thousands of units away from the real scene. That's
+    # not just wrong -- Open3D's voxel downsampling hard-crashes ("voxel_size
+    # is too small") once the point cloud's bounding box gets absurd relative
+    # to voxel_size, since it buckets points into a fixed-range integer grid.
+    # Drop such outliers before it ever gets there.
+    center = np.median(points, axis=0)
+    dist_from_center = np.linalg.norm(points - center, axis=1)
+    typical_dist = np.median(dist_from_center) + 1e-9
+    keep = dist_from_center < max(typical_dist * 50, 20.0)
+    if not np.all(keep):
+        print(
+            f"warning: dropping {np.sum(~keep)} / {len(points)} points as "
+            "extreme outliers (likely from a couple of unreliable camera "
+            "poses) before voxel downsampling"
+        )
+        points, colors, normals = points[keep], colors[keep], normals[keep]
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)

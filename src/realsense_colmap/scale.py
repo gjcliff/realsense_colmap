@@ -61,7 +61,7 @@ def estimate_scale(
         raise RuntimeError(
             "couldn't estimate metric scale: no sparse point had a valid "
             "matching depth reading. Check that depth/ frames line up with "
-            "the registered color images."
+            "the registered infrared images."
         )
 
     ratios = np.array(ratios)

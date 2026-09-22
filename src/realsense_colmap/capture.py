@@ -1,4 +1,13 @@
-"""Grab aligned color + depth frames from an Intel RealSense camera."""
+"""Grab depth + infrared + color frames from an Intel RealSense camera.
+
+Depth, at the hardware level, is computed from -- and natively registered to
+-- the left infrared imager, which (like the rest of the stereo module) is
+global-shutter. The RGB sensor is a separate, rolling-shutter part. Since
+rolling shutter breaks the single-rigid-pose-per-frame assumption SfM relies
+on, COLMAP is fed the infrared images, never color: geometry (poses, depth
+unprojection) comes entirely from the depth+IR pair, and color is only ever
+reprojected onto that geometry afterwards, in dense.py, to paint points.
+"""
 
 from __future__ import annotations
 
@@ -9,17 +18,17 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from .intrinsics import Intrinsics
+from .intrinsics import ColorCalibration, Intrinsics
 
 # Number of frames to discard at start-up while auto-exposure/white-balance
 # settle. Frames grabbed before this converge tend to be dark/washed out.
 _WARMUP_FRAMES = 30
 
 
-def _build_undistort_maps(color_profile) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Return (map1, map2) for cv2.remap, or (None, None) if the color stream
-    is already rectified (no distortion, or a model cv2 can't represent)."""
-    intr = color_profile.get_intrinsics()
+def _build_undistort_maps(profile) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return (map1, map2) for cv2.remap, or (None, None) if the stream is
+    already rectified (no distortion, or a model cv2 can't represent)."""
+    intr = profile.get_intrinsics()
     coeffs = np.array(intr.coeffs, dtype=np.float64)
 
     if np.allclose(coeffs, 0.0):
@@ -27,7 +36,7 @@ def _build_undistort_maps(color_profile) -> tuple[np.ndarray | None, np.ndarray 
 
     if intr.model != rs.distortion.brown_conrady:
         print(
-            f"warning: color stream distortion model is {intr.model}, which "
+            f"warning: stream distortion model is {intr.model}, which "
             "OpenCV's undistort can't represent; capturing without "
             "undistortion. Points near the image edges will be slightly off."
         )
@@ -68,14 +77,15 @@ def _configure_sensors(
     color_gain: float | None,
     auto_exposure_priority: bool,
     laser_power: float | None,
+    emitter_enabled: bool = True,
 ) -> None:
     """Apply manual exposure/gain and/or depth-projector settings, mainly
-    useful in low light: manual color exposure lets you push past what
-    auto-exposure would choose (and holds it steady across the whole scan,
-    which also helps SfM feature matching); auto-exposure-priority is a
-    lighter touch that just lets the frame rate drop instead of capping
-    exposure; laser_power boosts the IR dot pattern depth stereo matches on,
-    which matters more the less ambient light there is.
+    useful in low light. Color exposure/gain here only affect how the RGB
+    (paint-only) image looks -- they no longer have any bearing on pose
+    estimation or reconstruction geometry, since color never reaches COLMAP.
+    laser_power boosts the IR dot pattern both depth *and* the infrared
+    images COLMAP now uses rely on, which matters more the less ambient
+    light there is.
 
     Every option here is explicitly set or explicitly reset to its device
     default -- never left alone -- since these settings are sticky on the
@@ -126,12 +136,21 @@ def _configure_sensors(
     if auto_exposure_priority:
         print("auto-exposure priority enabled (frame rate may drop in low light)")
 
+    # Order matters here: on this firmware, writing *any* laser_power value
+    # -- even just resetting it to default -- silently flips emitter_enabled
+    # back to 1, regardless of what it was set to before. So laser_power has
+    # to be settled first, and emitter_enabled written last so it's the
+    # actual final word on whether the emitter fires.
     depth_sensor = device.first_depth_sensor()
     if laser_power is not None:
         _set_option_checked(depth_sensor, rs.option.laser_power, laser_power)
     else:
         _reset_option(depth_sensor, rs.option.laser_power)
-    print(f"laser power={depth_sensor.get_option(rs.option.laser_power)}")
+    depth_sensor.set_option(rs.option.emitter_enabled, 1 if emitter_enabled else 0)
+    print(
+        f"laser power={depth_sensor.get_option(rs.option.laser_power)}, "
+        f"emitter_enabled={depth_sensor.get_option(rs.option.emitter_enabled)}"
+    )
 
 
 def capture_sequence(
@@ -147,47 +166,82 @@ def capture_sequence(
     color_gain: float | None = None,
     auto_exposure_priority: bool = False,
     laser_power: float | None = None,
+    emitter_enabled: bool = True,
 ) -> Intrinsics:
-    """Stream color+depth from the first connected RealSense device and save
-    every `every_n`-th frame pair to `output_dir`/color and `output_dir`/depth.
+    """Stream depth+infrared+color from the first connected RealSense device
+    and save every `every_n`-th frame to `output_dir`/{ir,depth,rgb}.
 
-    Returns the Intrinsics used for the color stream (which the aligned depth
-    frames share), also written to `output_dir`/intrinsics.json.
+    Depth and infrared are natively co-registered by the hardware (verified:
+    identical intrinsics, identity extrinsic) so need no alignment step.
+    Color is captured in its own native frame and never warped -- it's
+    reprojected onto geometry per-point later, using the calibrated
+    depth-to-color extrinsic saved in color_calibration.json.
+
+    Returns the Intrinsics for the depth/infrared camera (what everything
+    downstream treats as "the" camera), also written to
+    `output_dir`/intrinsics.json.
     """
-    color_dir = output_dir / "color"
+    ir_dir = output_dir / "ir"
     depth_dir = output_dir / "depth"
-    color_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir = output_dir / "rgb"
+    ir_dir.mkdir(parents=True, exist_ok=True)
     depth_dir.mkdir(parents=True, exist_ok=True)
+    rgb_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+    config.enable_stream(rs.stream.infrared, 1, width, height, rs.format.y8, fps)
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
     profile = pipeline.start(config)
-    align = rs.align(rs.stream.color)
 
     _configure_sensors(
-        profile, fps, color_exposure, color_gain, auto_exposure_priority, laser_power
+        profile,
+        fps,
+        color_exposure,
+        color_gain,
+        auto_exposure_priority,
+        laser_power,
+        emitter_enabled,
     )
 
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_scale = depth_sensor.get_depth_scale()
 
+    depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+    ir_profile = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
     color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-    intr = color_profile.get_intrinsics()
+
+    ir_intr = ir_profile.get_intrinsics()
     intrinsics = Intrinsics(
-        width=intr.width,
-        height=intr.height,
-        fx=intr.fx,
-        fy=intr.fy,
-        cx=intr.ppx,
-        cy=intr.ppy,
+        width=ir_intr.width,
+        height=ir_intr.height,
+        fx=ir_intr.fx,
+        fy=ir_intr.fy,
+        cx=ir_intr.ppx,
+        cy=ir_intr.ppy,
         depth_scale=depth_scale,
     )
     intrinsics.save(output_dir / "intrinsics.json")
 
-    map1, map2 = _build_undistort_maps(color_profile)
+    color_intr = color_profile.get_intrinsics()
+    extrinsics = depth_profile.get_extrinsics_to(color_profile)
+    color_calibration = ColorCalibration(
+        width=color_intr.width,
+        height=color_intr.height,
+        fx=color_intr.fx,
+        fy=color_intr.fy,
+        cx=color_intr.ppx,
+        cy=color_intr.ppy,
+        rotation=list(extrinsics.rotation),
+        translation=list(extrinsics.translation),
+    )
+    color_calibration.save(output_dir / "color_calibration.json")
+
+    # IR and depth share a frame, so one undistort map pair serves both.
+    ir_map1, ir_map2 = _build_undistort_maps(ir_profile)
+    color_map1, color_map2 = _build_undistort_maps(color_profile)
 
     saved = 0
     grabbed = 0
@@ -205,35 +259,43 @@ def capture_sequence(
                 break
 
             frames = pipeline.wait_for_frames()
-            aligned = align.process(frames)
-            depth_frame = aligned.get_depth_frame()
-            color_frame = aligned.get_color_frame()
-            if not depth_frame or not color_frame:
+            depth_frame = frames.get_depth_frame()
+            ir_frame = frames.get_infrared_frame(1)
+            color_frame = frames.get_color_frame()
+            if not depth_frame or not ir_frame or not color_frame:
                 continue
 
             grabbed += 1
             if (grabbed - 1) % every_n != 0:
                 continue
 
-            color_image = np.asanyarray(color_frame.get_data())
+            ir_image = np.asanyarray(ir_frame.get_data())
             depth_image = np.asanyarray(depth_frame.get_data())  # uint16, raw units
+            rgb_image = np.asanyarray(color_frame.get_data())
 
-            if map1 is not None:
-                color_image = cv2.remap(color_image, map1, map2, cv2.INTER_LINEAR)
-                depth_image = cv2.remap(depth_image, map1, map2, cv2.INTER_NEAREST)
+            if ir_map1 is not None:
+                ir_image = cv2.remap(ir_image, ir_map1, ir_map2, cv2.INTER_LINEAR)
+                depth_image = cv2.remap(
+                    depth_image, ir_map1, ir_map2, cv2.INTER_NEAREST
+                )
+            if color_map1 is not None:
+                rgb_image = cv2.remap(
+                    rgb_image, color_map1, color_map2, cv2.INTER_LINEAR
+                )
 
             stem = f"{saved:06d}"
-            cv2.imwrite(str(color_dir / f"{stem}.png"), color_image)
+            cv2.imwrite(str(ir_dir / f"{stem}.png"), ir_image)
             cv2.imwrite(str(depth_dir / f"{stem}.png"), depth_image)
+            cv2.imwrite(str(rgb_dir / f"{stem}.png"), rgb_image)
             saved += 1
 
             if preview:
                 try:
                     depth_vis = cv2.convertScaleAbs(depth_image, alpha=0.03)
                     depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-                    preview_color = color_image.copy()
+                    preview_ir = cv2.cvtColor(ir_image, cv2.COLOR_GRAY2BGR)
                     cv2.putText(
-                        preview_color,
+                        preview_ir,
                         f"saved {saved} ({stem}.png)  [q to stop]",
                         (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -242,8 +304,9 @@ def capture_sequence(
                         2,
                         cv2.LINE_AA,
                     )
-                    cv2.imshow("realsense-colmap: color (saved frames)", preview_color)
-                    cv2.imshow("realsense-colmap: depth (saved frames)", depth_vis)
+                    cv2.imshow("realsense-colmap: infrared (fed to COLMAP)", preview_ir)
+                    cv2.imshow("realsense-colmap: depth", depth_vis)
+                    cv2.imshow("realsense-colmap: color (paint only)", rgb_image)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                 except cv2.error as e:
@@ -265,5 +328,5 @@ def capture_sequence(
         if preview:
             cv2.destroyAllWindows()
 
-    print(f"\nsaved {saved} frame pairs to {output_dir}")
+    print(f"\nsaved {saved} frames to {output_dir}")
     return intrinsics
