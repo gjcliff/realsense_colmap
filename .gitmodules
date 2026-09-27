@@ -1,0 +1,3 @@
+[submodule "external/ros2-calib-docker"]
+	path = external/ros2-calib-docker
+	url = git@github.com:gjcliff/ros2-calib-docker.git
