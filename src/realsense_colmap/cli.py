@@ -9,8 +9,6 @@ def _cmd_capture(args: argparse.Namespace) -> None:
 
     capture_sequence(
         output_dir=Path(args.output),
-        width=args.width,
-        height=args.height,
         fps=args.fps,
         num_frames=args.num_frames,
         seconds=args.seconds,
@@ -101,8 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     cap = subparsers.add_parser("capture", help="record color+depth frames")
     cap.add_argument("-o", "--output", required=True, help="output directory")
-    cap.add_argument("--width", type=int, default=1280)
-    cap.add_argument("--height", type=int, default=720)
     cap.add_argument("--fps", type=int, default=15)
     cap.add_argument(
         "--num-frames", type=int, default=None, help="stop after this many saved frames"

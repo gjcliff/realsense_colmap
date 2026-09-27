@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pycolmap>=4.2.0",
     "pyrealsense2>=2.58.4.10922",
+    "pyyaml>=6.0.3",
     "rerun-sdk>=0.38.1",
     "tqdm>=4.70.1",
 ]

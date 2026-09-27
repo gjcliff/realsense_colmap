@@ -11,12 +11,15 @@ reprojected onto that geometry afterwards, in dense.py, to paint points.
 
 from __future__ import annotations
 
+import tarfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+import yaml
 
 from .intrinsics import ColorCalibration, Intrinsics
 
@@ -24,28 +27,67 @@ from .intrinsics import ColorCalibration, Intrinsics
 # settle. Frames grabbed before this converge tend to be dark/washed out.
 _WARMUP_FRAMES = 30
 
+# The device's live-reported intrinsics have drifted from factory
+# calibration, so both streams are calibrated externally (ROS2
+# camera_calibration, checkerboard) instead -- see
+# external/ros2-calib-docker. No live-SDK fallback: a missing/unreadable
+# calibration archive is a hard error, not a reason to silently trust the
+# SDK's (known-wrong) numbers instead.
+_CALIB_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "external" / "ros2-calib-docker" / "calibration_data"
+)
+_IR_CALIB_TAR = _CALIB_DIR / "infrared" / "calibrationdata.tar.gz"
+_COLOR_CALIB_TAR = _CALIB_DIR / "color" / "calibrationdata.tar.gz"
 
-def _build_undistort_maps(profile) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Return (map1, map2) for cv2.remap, or (None, None) if the stream is
-    already rectified (no distortion, or a model cv2 can't represent)."""
-    intr = profile.get_intrinsics()
-    coeffs = np.array(intr.coeffs, dtype=np.float64)
 
+class _CameraCalibration(NamedTuple):
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    coeffs: np.ndarray  # 5-element plumb_bob/brown_conrady (k1,k2,p1,p2,k3)
+
+
+def _load_camera_calibration(tar_path: Path) -> _CameraCalibration:
+    """Load a checkerboard-calibrated camera's intrinsics + distortion from
+    the ost.yaml inside a ROS `camera_calibration` calibrationdata.tar.gz
+    archive -- read directly out of the tar, never extracted to disk."""
+    if not tar_path.is_file():
+        raise FileNotFoundError(
+            f"calibration archive not found at {tar_path}. capture_sequence "
+            "requires checkerboard calibrations for both the infrared and "
+            "color streams (see external/ros2-calib-docker/calibration_data) "
+            "and will not fall back to the camera's live-reported intrinsics."
+        )
+    with tarfile.open(tar_path) as tf:
+        member = tf.extractfile("ost.yaml")
+        if member is None:
+            raise FileNotFoundError(f"ost.yaml not found inside {tar_path}")
+        doc = yaml.safe_load(member.read())
+    m = doc["camera_matrix"]["data"]
+    coeffs = np.array(doc["distortion_coefficients"]["data"], dtype=np.float64)
+    return _CameraCalibration(
+        width=doc["image_width"],
+        height=doc["image_height"],
+        fx=m[0], fy=m[4], cx=m[2], cy=m[5],
+        coeffs=coeffs,
+    )
+
+
+def _build_undistort_maps(
+    fx: float, fy: float, cx: float, cy: float,
+    coeffs: np.ndarray, width: int, height: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return (map1, map2) for cv2.remap, or (None, None) if already
+    rectified (zero distortion)."""
+    coeffs = np.asarray(coeffs, dtype=np.float64)
     if np.allclose(coeffs, 0.0):
         return None, None
-
-    if intr.model != rs.distortion.brown_conrady:
-        print(
-            f"warning: stream distortion model is {intr.model}, which "
-            "OpenCV's undistort can't represent; capturing without "
-            "undistortion. Points near the image edges will be slightly off."
-        )
-        return None, None
-
-    k = np.array([[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]])
-    size = (intr.width, intr.height)
-    map1, map2 = cv2.initUndistortRectifyMap(k, coeffs, None, k, size, cv2.CV_32FC1)
-    return map1, map2
+    k = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    return cv2.initUndistortRectifyMap(k, coeffs, None, k, (width, height), cv2.CV_32FC1)
 
 
 def _set_option_checked(sensor: rs.sensor, option: rs.option, value: float) -> None:
@@ -151,8 +193,6 @@ def _configure_sensors(
 
 def capture_sequence(
     output_dir: Path,
-    width: int = 640,
-    height: int = 480,
     fps: int = 30,
     num_frames: int | None = None,
     seconds: float | None = None,
@@ -173,10 +213,18 @@ def capture_sequence(
     reprojected onto geometry per-point later, using the calibrated
     depth-to-color extrinsic saved in color_calibration.json.
 
+    Both streams' resolution comes from their respective checkerboard
+    calibrations (see _load_camera_calibration), not a user-configurable
+    setting -- a calibration is only valid at the resolution it was taken
+    at.
+
     Returns the Intrinsics for the depth/infrared camera (what everything
     downstream treats as "the" camera), also written to
     `output_dir`/intrinsics.json.
     """
+    ir_calib = _load_camera_calibration(_IR_CALIB_TAR)
+    color_calib = _load_camera_calibration(_COLOR_CALIB_TAR)
+
     ir_dir = output_dir / "ir"
     depth_dir = output_dir / "depth"
     rgb_dir = output_dir / "rgb"
@@ -186,9 +234,9 @@ def capture_sequence(
 
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-    config.enable_stream(rs.stream.infrared, 1, width, height, rs.format.y8, fps)
-    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+    config.enable_stream(rs.stream.depth, ir_calib.width, ir_calib.height, rs.format.z16, fps)
+    config.enable_stream(rs.stream.infrared, 1, ir_calib.width, ir_calib.height, rs.format.y8, fps)
+    config.enable_stream(rs.stream.color, color_calib.width, color_calib.height, rs.format.bgr8, fps)
 
     profile = pipeline.start(config)
 
@@ -206,38 +254,44 @@ def capture_sequence(
     depth_scale = depth_sensor.get_depth_scale()
 
     depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-    ir_profile = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
     color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
 
-    ir_intr = ir_profile.get_intrinsics()
     intrinsics = Intrinsics(
-        width=ir_intr.width,
-        height=ir_intr.height,
-        fx=ir_intr.fx,
-        fy=ir_intr.fy,
-        cx=ir_intr.ppx,
-        cy=ir_intr.ppy,
+        width=ir_calib.width,
+        height=ir_calib.height,
+        fx=ir_calib.fx,
+        fy=ir_calib.fy,
+        cx=ir_calib.cx,
+        cy=ir_calib.cy,
         depth_scale=depth_scale,
     )
     intrinsics.save(output_dir / "intrinsics.json")
 
-    color_intr = color_profile.get_intrinsics()
+    # ROS2's monocular checkerboard calibration gives each camera's own
+    # intrinsics/distortion, but not the baseline *between* the IR and color
+    # sensors -- that still comes from the live device's factory extrinsic.
     extrinsics = depth_profile.get_extrinsics_to(color_profile)
     color_calibration = ColorCalibration(
-        width=color_intr.width,
-        height=color_intr.height,
-        fx=color_intr.fx,
-        fy=color_intr.fy,
-        cx=color_intr.ppx,
-        cy=color_intr.ppy,
+        width=color_calib.width,
+        height=color_calib.height,
+        fx=color_calib.fx,
+        fy=color_calib.fy,
+        cx=color_calib.cx,
+        cy=color_calib.cy,
         rotation=list(extrinsics.rotation),
         translation=list(extrinsics.translation),
     )
     color_calibration.save(output_dir / "color_calibration.json")
 
     # IR and depth share a frame, so one undistort map pair serves both.
-    ir_map1, ir_map2 = _build_undistort_maps(ir_profile)
-    color_map1, color_map2 = _build_undistort_maps(color_profile)
+    ir_map1, ir_map2 = _build_undistort_maps(
+        ir_calib.fx, ir_calib.fy, ir_calib.cx, ir_calib.cy,
+        ir_calib.coeffs, ir_calib.width, ir_calib.height,
+    )
+    color_map1, color_map2 = _build_undistort_maps(
+        color_calib.fx, color_calib.fy, color_calib.cx, color_calib.cy,
+        color_calib.coeffs, color_calib.width, color_calib.height,
+    )
 
     saved = 0
     grabbed = 0
