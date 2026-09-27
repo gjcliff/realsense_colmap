@@ -25,12 +25,12 @@ def _cmd_capture(args: argparse.Namespace) -> None:
 
 
 def _cmd_reconstruct(args: argparse.Namespace) -> None:
+    import open3d as o3d
+
     from .dense import fuse_dense_point_cloud, mesh_from_point_cloud
     from .intrinsics import ColorCalibration, Intrinsics
     from .scale import estimate_scale
     from .sparse import run_sparse_reconstruction
-
-    import open3d as o3d
 
     input_dir = Path(args.input)
     output_dir = Path(args.output) if args.output else input_dir / "reconstruction"
@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--every-n",
         type=int,
         default=1,
-        help="only save every Nth grabbed frame (reduces redundancy)",
+        help="only save every Nth grabbed frame",
     )
     cap.add_argument(
         "--no-preview",

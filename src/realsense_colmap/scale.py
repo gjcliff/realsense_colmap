@@ -65,15 +65,33 @@ def estimate_scale(
         )
 
     ratios = np.array(ratios)
-    scale = float(np.median(ratios))
-    spread = float(np.std(ratios) / scale) if scale else float("inf")
+    raw_median = np.median(ratios)
+
+    # The median alone is already robust to outliers for the center estimate,
+    # but degenerately-triangulated points (near-zero sfm_depth from weak
+    # parallax) can still produce ratios in the thousands, which dominate the
+    # std and make the reported uncertainty meaningless even when the median
+    # itself is fine. Trim by a robust (MAD-based) outlier threshold before
+    # reporting/using the spread, so it reflects the quality of the data
+    # that's actually left, not noise from points we already know are junk.
+    mad = np.median(np.abs(ratios - raw_median)) + 1e-12
+    modified_z = 0.6745 * (ratios - raw_median) / mad
+    keep = np.abs(modified_z) < 5.0
+    trimmed = ratios[keep]
+
+    scale = float(np.median(trimmed))
+    spread = float(np.std(trimmed) / scale) if scale else float("inf")
+    n_dropped = len(ratios) - len(trimmed)
     print(
         f"estimated metric scale = {scale:.4f} "
-        f"(from {len(ratios)} point observations, relative std {spread:.2%})"
+        f"(from {len(trimmed)} point observations after dropping "
+        f"{n_dropped} ({n_dropped / len(ratios):.1%}) as robust outliers; "
+        f"relative std {spread:.2%})"
     )
     if spread > 0.5:
         print(
-            "warning: scale estimate is noisy (relative std > 50%). The "
-            "dense reconstruction's absolute scale may be unreliable."
+            "warning: scale estimate is noisy (relative std > 50%) even "
+            "after outlier trimming. The dense reconstruction's absolute "
+            "scale may be unreliable."
         )
     return scale

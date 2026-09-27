@@ -42,13 +42,9 @@ def _build_undistort_maps(profile) -> tuple[np.ndarray | None, np.ndarray | None
         )
         return None, None
 
-    k = np.array(
-        [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]]
-    )
+    k = np.array([[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]])
     size = (intr.width, intr.height)
-    map1, map2 = cv2.initUndistortRectifyMap(
-        k, coeffs, None, k, size, cv2.CV_32FC1
-    )
+    map1, map2 = cv2.initUndistortRectifyMap(k, coeffs, None, k, size, cv2.CV_32FC1)
     return map1, map2
 
 
@@ -71,7 +67,7 @@ def _reset_option(sensor: rs.sensor, option: rs.option) -> None:
 
 
 def _configure_sensors(
-    profile: "rs.pipeline_profile",
+    profile: rs.pipeline_profile,
     fps: int,
     color_exposure: float | None,
     color_gain: float | None,
@@ -245,7 +241,6 @@ def capture_sequence(
 
     saved = 0
     grabbed = 0
-    start_time = None
     try:
         for _ in range(_WARMUP_FRAMES):
             pipeline.wait_for_frames()
