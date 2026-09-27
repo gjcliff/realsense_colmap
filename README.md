@@ -6,6 +6,13 @@ estimation.
 
 ![my house](./media/my_house.png)
 
+## Stubs setup
+
+```bash
+uv sync
+uv run pybind11-stubgen pyrealsense2 -o typings
+```
+
 ## How it works
 
 Monocular structure-from-motion (what COLMAP does from images alone) only

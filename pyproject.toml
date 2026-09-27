@@ -17,9 +17,20 @@ dependencies = [
     "tqdm>=4.70.1",
 ]
 
+[tool.ty.environment]
+extra-paths = ["typings"]
+
+[tool.ruff]
+extend-exclude = ["typings"]
+
 [project.scripts]
 realsense-colmap = "realsense_colmap:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pybind11-stubgen>=3.0.0",
+]

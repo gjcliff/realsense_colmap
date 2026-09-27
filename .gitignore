@@ -11,3 +11,5 @@ wheels/
 
 # Captured data / reconstruction output
 /data/
+
+typings/
